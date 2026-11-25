@@ -1435,6 +1435,9 @@ impl EditorView {
         if let Some((on_next_key, kind_)) = self.on_next_key.take() {
             if kind == kind_ {
                 on_next_key(ctx, event);
+                if let Some(command) = commands::vim_hx_hooks::take_repeatable_change() {
+                    self.last_insert = (command, Vec::new());
+                }
                 true
             } else {
                 self.on_next_key = Some((on_next_key, kind_));

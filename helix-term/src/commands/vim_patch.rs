@@ -1,6 +1,9 @@
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Mutex,
+use std::{
+    cell::RefCell,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
 };
 
 use crate::commands::*;
@@ -26,6 +29,78 @@ pub struct AtomicState {
     vim_mode: AtomicBool,
     vim_pend_enable: AtomicBool,
     gv_selection: Mutex<Option<(Selection, DocumentId)>>,
+}
+
+thread_local! {
+    static CHANGE_RECORDER: RefCell<ChangeRecorder> = RefCell::default();
+}
+
+#[derive(Clone)]
+struct VimChange {
+    op: VimOp,
+    count: usize,
+    register: Option<char>,
+    keys: Vec<KeyEvent>,
+}
+
+#[derive(Default)]
+struct ChangeRecorder {
+    pending: Option<VimChange>,
+    last: Option<VimChange>,
+    committed: bool,
+    replaying: bool,
+}
+
+impl ChangeRecorder {
+    fn with<T>(f: impl FnOnce(&mut Self) -> T) -> T {
+        CHANGE_RECORDER.with_borrow_mut(f)
+    }
+
+    fn start(op: VimOp, count: usize, register: Option<char>) {
+        Self::with(|recorder| {
+            if !recorder.replaying {
+                recorder.pending = Some(VimChange {
+                    op,
+                    count,
+                    register,
+                    keys: Vec::new(),
+                });
+            }
+        });
+    }
+
+    fn record_key(event: KeyEvent) {
+        Self::with(|recorder| {
+            if let Some(pending) = &mut recorder.pending {
+                pending.keys.push(event);
+            }
+        });
+    }
+
+    fn clear_pending() {
+        Self::with(|recorder| recorder.pending = None);
+    }
+
+    fn commit() {
+        Self::with(|recorder| {
+            if let Some(pending) = recorder.pending.take() {
+                recorder.last = Some(pending);
+                recorder.committed = true;
+            }
+        });
+    }
+
+    fn take_committed() -> bool {
+        Self::with(|recorder| std::mem::take(&mut recorder.committed))
+    }
+
+    fn last() -> Option<VimChange> {
+        Self::with(|recorder| recorder.last.clone())
+    }
+
+    fn set_replaying(val: bool) {
+        Self::with(|recorder| recorder.replaying = val);
+    }
 }
 
 pub static VIM_STATE: AtomicState = AtomicState::new();
@@ -188,6 +263,10 @@ pub mod vim_hx_hooks {
         };
     }
 
+    pub fn take_repeatable_change() -> Option<MappableCommand> {
+        ChangeRecorder::take_committed().then_some(MappableCommand::vim_repeat_last_change)
+    }
+
     pub fn after_paste_start_pos(text: &Rope, range: &Range) -> usize {
         // A hacky method to switch between helix/vim paste
         if !VIM_STATE.is_vim_paste() {
@@ -319,6 +398,7 @@ macro_rules! static_commands_with_default {
         vim_cmd_on, "End vim_cmd_off, only works in Vim mode (vim.hx)",
         vim_visual_block, "Enter visual block mode (vim)",
         vim_insert_at_line_start, "Insert at start of line except in visual block mode (vim)",
+        vim_repeat_last_change, "Repeat last change (vim)",
             $($name, $doc,)*
         }
     };
@@ -619,6 +699,26 @@ mod vim_commands {
 
     pub fn vim_change(cx: &mut Context) {
         VimOpCtx::operator_impl(cx, VimOp::Change, cx.register);
+    }
+
+    pub fn vim_repeat_last_change(cx: &mut Context) {
+        let Some(change) = ChangeRecorder::last() else {
+            return;
+        };
+
+        ChangeRecorder::set_replaying(true);
+        cx.count = std::num::NonZeroUsize::new(change.count);
+        VimOpCtx::operator_impl(cx, change.op, change.register);
+        for key in change.keys {
+            let Some((callback, _)) = cx.on_next_key_callback.take() else {
+                break;
+            };
+            callback(cx, key);
+        }
+        cx.on_next_key_callback = None;
+        cx.editor.autoinfo = None;
+        cx.count = None;
+        ChangeRecorder::set_replaying(false);
     }
 
     pub fn vim_delete_till_line_end(cx: &mut Context) {
@@ -1240,6 +1340,8 @@ impl VimOpCtx {
             _ => return,
         }
 
+        ChangeRecorder::commit();
+
         if self.op == VimOp::Change {
             insert_mode(cx);
         }
@@ -1296,6 +1398,19 @@ impl VimOpCtx {
         Self::vim_find_char(cx, Some(*self), Direction::Backward, true, true);
     }
 
+    fn on_next_operator_key(
+        cx: &mut Context,
+        on_next_key: impl FnOnce(&mut Context, KeyEvent) + 'static,
+    ) {
+        cx.on_next_key(move |cx, event| {
+            ChangeRecorder::record_key(event);
+            on_next_key(cx, event);
+            if cx.on_next_key_callback.is_none() {
+                ChangeRecorder::clear_pending();
+            }
+        });
+    }
+
     pub fn operator_impl(cx: &mut Context, op: VimOp, register: Option<char>) {
         let opcx = Self::with_custom_register(cx, op, register);
         if cx.editor.mode == Mode::Select {
@@ -1316,7 +1431,8 @@ impl VimOpCtx {
             return;
         }
 
-        cx.on_next_key(move |cx, event| {
+        ChangeRecorder::start(op, opcx.count.unwrap_or(1), register);
+        Self::on_next_operator_key(cx, move |cx, event| {
             cx.editor.autoinfo = None;
             if let Some(ch) = event.char() {
                 match ch {
@@ -1375,7 +1491,7 @@ impl VimOpCtx {
         // need to wait for next key
         // TODO: should this be done by grapheme rather than char?  For example,
         // we can't properly handle the line-ending CRLF case here in terms of char.
-        cx.on_next_key(move |cx, event| {
+        Self::on_next_operator_key(cx, move |cx, event| {
             let motion: Motion = if event.code == KeyCode::Enter {
                 Box::new(move |editor: &mut Editor| {
                     find_char_line_ending_motion(editor, count, direction, inclusive, extend);
@@ -1447,7 +1563,7 @@ impl VimOpCtx {
             cx.count()
         };
 
-        cx.on_next_key(move |cx, event| {
+        Self::on_next_operator_key(cx, move |cx, event| {
             cx.editor.autoinfo = None;
             if let Some(ch) = event.char() {
                 let (view, doc) = current!(cx.editor);
